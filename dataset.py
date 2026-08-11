@@ -1,216 +1,242 @@
 """
-dataset.py — MutaShield-Net Data Pipeline
-Dataset: CICIDS2017 / CSE-CIC-IDS2018  (Section IV-A)
-Download URL: https://www.unb.ca/cic/datasets/ids-2017.html
-            https://www.kaggle.com/datasets/cicdataset/cicids2017
+dataset.py — MutaShield-Net Dataset Handling
+Dataset: CIC-IDS2017 and CSE-CIC-IDS2018
+Source: Canadian Institute for Cybersecurity, University of New Brunswick
+CIC-IDS2017 URL: https://www.unb.ca/cic/datasets/ids-2017.html
+CSE-CIC-IDS2018 URL: https://www.unb.ca/cic/datasets/ids-2018.html
+
+Preprocessing follows Section IV-A-1 and IV-A-2:
+  - 80 CICFlowMeter features
+  - Duplicate removal by 5-tuple matching
+  - Temporally stratified 70/10/20 split (days 1-3 train, day 4 val, day 5 test)
+  - Class imbalance: benign traffic >80% of both corpora
 """
 
 import os
 import glob
-import warnings
+import pickle
+import logging
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing   import StandardScaler, LabelEncoder
+from sklearn.preprocessing import StandardScaler
+from sklearn.utils import shuffle
 import torch
 from torch.utils.data import Dataset, DataLoader
 
-warnings.filterwarnings("ignore")
+import config
 
-from config import (DATA_DIR, LABEL_COLUMN, NUM_FEATURES, TRAIN_RATIO,
-                    VAL_RATIO, RANDOM_SEED, CAGRT, TRAIN, CLASS_NAMES)
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+log = logging.getLogger(__name__)
 
+# ─── CICFlowMeter column name normalisations ────────────────────────────────
+# The CSVs from CIC have inconsistent leading/trailing spaces; strip all.
 
-# ─── Download helper ──────────────────────────────────────────────────────────
-def download_cicids2017(target_dir: str = DATA_DIR):
-    """
-    CICIDS2017 download instructions.
-    Official: https://www.unb.ca/cic/datasets/ids-2017.html
-    Kaggle mirror (requires kaggle API key):
-        kaggle datasets download -d cicdataset/cicids2017 -p <target_dir>
-    """
-    print("=" * 60)
-    print("CICIDS2017 Dataset Download")
-    print("=" * 60)
-    print("Option 1 – Official (manual):")
-    print("  https://www.unb.ca/cic/datasets/ids-2017.html")
-    print("  Place all CSV files in:  data/cicids2017/")
-    print()
-    print("Option 2 – Kaggle CLI:")
-    print("  pip install kaggle")
-    print("  kaggle datasets download -d cicdataset/cicids2017 \\")
-    print(f"    --path {os.path.join(target_dir, 'cicids2017')}")
-    print("  unzip the archive in that folder")
-    print("=" * 60)
+LABEL_COL   = "Label"
+BENIGN_STR  = "BENIGN"
 
-    # Try kaggle download automatically if API is configured
-    try:
-        import kaggle
-        save_path = os.path.join(target_dir, "cicids2017")
-        os.makedirs(save_path, exist_ok=True)
-        kaggle.api.dataset_download_files(
-            "cicdataset/cicids2017", path=save_path, unzip=True
-        )
-        print(f"Downloaded to {save_path}")
-    except Exception:
-        print("Kaggle auto-download skipped — place CSV files manually.")
+# Features to drop (non-numeric or constant in CIC exports)
+DROP_COLS = [
+    "Flow ID", "Source IP", "Source Port", "Destination IP",
+    "Destination Port", "Protocol", "Timestamp",
+]
 
 
-# ─── Loading & preprocessing ──────────────────────────────────────────────────
-def load_cicids2017(data_dir: str = None) -> pd.DataFrame:
-    """
-    Load all CICIDS2017 CSV files in data/cicids2017/.
-    Returns a cleaned DataFrame.  (Section IV-A)
-    """
-    data_dir = data_dir or os.path.join(DATA_DIR, "cicids2017")
-    csv_files = glob.glob(os.path.join(data_dir, "**/*.csv"), recursive=True)
-    if not csv_files:
-        csv_files = glob.glob(os.path.join(data_dir, "*.csv"))
-    if not csv_files:
-        raise FileNotFoundError(
-            f"No CSV files found in {data_dir}. "
-            "Run download_cicids2017() first."
-        )
-
-    print(f"Found {len(csv_files)} CSV file(s). Loading…")
-    frames = []
-    for f in csv_files:
-        try:
-            df = pd.read_csv(f, low_memory=False)
-            frames.append(df)
-            print(f"  {os.path.basename(f)}: {len(df):,} rows")
-        except Exception as e:
-            print(f"  Skipping {f}: {e}")
-    df = pd.concat(frames, ignore_index=True)
-    print(f"Total loaded: {len(df):,} rows, {df.shape[1]} columns")
+def _strip_columns(df: pd.DataFrame) -> pd.DataFrame:
+    df.columns = df.columns.str.strip()
     return df
 
 
-def preprocess(df: pd.DataFrame, fit: bool = True,
-               scaler: StandardScaler = None,
-               encoder: LabelEncoder  = None):
+def _load_csv_dir(directory: str) -> pd.DataFrame:
+    """Load all CSV files from a directory and concatenate."""
+    paths = sorted(glob.glob(os.path.join(directory, "**", "*.csv"), recursive=True))
+    if not paths:
+        paths = sorted(glob.glob(os.path.join(directory, "*.csv")))
+    if not paths:
+        raise FileNotFoundError(
+            f"No CSV files found in {directory}. "
+            "Download the dataset from https://www.unb.ca/cic/datasets/ids-2017.html "
+            "and place all CICFlowMeter CSV files under data/CIC-IDS2017/raw/"
+        )
+    log.info(f"Loading {len(paths)} CSV file(s) from {directory}")
+    frames = []
+    for p in paths:
+        try:
+            df = pd.read_csv(p, encoding="utf-8", low_memory=False)
+        except UnicodeDecodeError:
+            df = pd.read_csv(p, encoding="latin-1", low_memory=False)
+        df = _strip_columns(df)
+        frames.append(df)
+        log.info(f"  {os.path.basename(p)}: {len(df):,} rows")
+    return pd.concat(frames, ignore_index=True)
+
+
+def _remove_duplicates(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Section IV-A preprocessing:
-      1. Drop inf / NaN
-      2. Encode labels
-      3. Select 80 numeric features
-      4. StandardScaler normalisation
-    Returns X (np.float32), y (np.int64), scaler, encoder
+    Section IV-A-2: remove duplicates by matching 5-tuples with identical
+    feature vectors. CIC CSVs do not export raw 5-tuple fields, so we
+    deduplicate on the full 80-feature numeric vector instead.
     """
-    # ── 1. Clean ──────────────────────────────────────────────────────────────
-    df = df.replace([np.inf, -np.inf], np.nan).dropna().reset_index(drop=True)
+    before = len(df)
+    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    df = df.drop_duplicates(subset=numeric_cols)
+    log.info(f"Duplicate removal: {before:,} -> {len(df):,} rows "
+             f"({before - len(df):,} removed)")
+    return df
 
-    # ── 2. Labels ─────────────────────────────────────────────────────────────
-    label_col = LABEL_COLUMN if LABEL_COLUMN in df.columns else "Label"
-    if label_col not in df.columns:
-        label_col = [c for c in df.columns if c.strip().lower() == "label"][0]
 
-    df[label_col] = df[label_col].str.strip()
-    if encoder is None:
-        encoder = LabelEncoder()
-        y = encoder.fit_transform(df[label_col].values)
-    else:
-        y = encoder.transform(df[label_col].values)
+def _encode_labels(df: pd.DataFrame, label_map: dict) -> pd.DataFrame:
+    df[LABEL_COL] = df[LABEL_COL].str.strip()
+    # Map known labels; unknown labels get -1 and are dropped
+    df["label_int"] = df[LABEL_COL].map(label_map)
+    before = len(df)
+    df = df.dropna(subset=["label_int"])
+    df["label_int"] = df["label_int"].astype(int)
+    if len(df) < before:
+        log.warning(f"Dropped {before - len(df)} rows with unrecognised labels.")
+    return df
 
-    # ── 3. Features ───────────────────────────────────────────────────────────
-    drop_cols = [label_col] + [c for c in df.columns
-                               if df[c].dtype == object]
-    X_df = df.drop(columns=drop_cols, errors="ignore")
-    # Keep at most 80 numeric columns
-    numeric_cols = X_df.select_dtypes(include=[np.number]).columns.tolist()
-    numeric_cols = numeric_cols[:NUM_FEATURES]
-    X = X_df[numeric_cols].values.astype(np.float32)
 
-    # ── 4. Scale ──────────────────────────────────────────────────────────────
+def preprocess(df: pd.DataFrame, label_map: dict, scaler=None, fit_scaler=True):
+    """
+    Full preprocessing pipeline:
+    1. Encode labels
+    2. Drop non-feature columns
+    3. Replace inf/NaN with 0
+    4. Standard-scale features
+    Returns: X (np.ndarray), y (np.ndarray), fitted scaler
+    """
+    df = _encode_labels(df, label_map)
+
+    drop_existing = [c for c in DROP_COLS if c in df.columns]
+    feature_cols  = [c for c in df.columns
+                     if c not in drop_existing + [LABEL_COL, "label_int"]]
+
+    X = df[feature_cols].values.astype(np.float32)
+    y = df["label_int"].values.astype(np.int64)
+
+    # Replace inf and NaN — Section IV-A-1
+    X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # Clip extreme values to prevent scaler blow-up
+    X = np.clip(X, -1e9, 1e9)
+
     if scaler is None:
         scaler = StandardScaler()
+    if fit_scaler:
         X = scaler.fit_transform(X)
     else:
         X = scaler.transform(X)
 
-    return X.astype(np.float32), y.astype(np.int64), scaler, encoder
+    log.info(f"Feature matrix: {X.shape}, classes: {np.unique(y)}")
+    return X, y, scaler
 
 
-# ─── PyTorch Dataset ──────────────────────────────────────────────────────────
-class CICIDSDataset(Dataset):
+def temporally_split(X, y, timestamps=None):
     """
-    Returns (packet_features, semantic_features, label).
-    The 80 features are split into two 40-dim domains as per Section III-C.
+    Section IV-A-2: temporally stratified protocol.
+    When timestamps are unavailable (raw CSVs are already day-ordered),
+    we approximate by positional ordering — first 70% train,
+    next 10% val, last 20% test.
+    """
+    n = len(X)
+    n_train = int(n * config.TRAIN_RATIO)
+    n_val   = int(n * (config.TRAIN_RATIO + config.VAL_RATIO))
+
+    X_train, y_train = X[:n_train], y[:n_train]
+    X_val,   y_val   = X[n_train:n_val], y[n_train:n_val]
+    X_test,  y_test  = X[n_val:],        y[n_val:]
+
+    log.info(f"Split: train={len(X_train):,}, val={len(X_val):,}, test={len(X_test):,}")
+    return (X_train, y_train), (X_val, y_val), (X_test, y_test)
+
+
+def build_dataset_cic2017(raw_dir=config.CIC2017_RAW_DIR,
+                           proc_dir=config.CIC2017_PROC_DIR,
+                           force_rebuild=False):
+    """
+    Full pipeline for CIC-IDS2017.
+    Returns train/val/test splits plus the fitted scaler.
+    Caches processed arrays to proc_dir.
+    """
+    cache_path = os.path.join(proc_dir, "cic2017_splits.pkl")
+    if os.path.exists(cache_path) and not force_rebuild:
+        log.info(f"Loading cached splits from {cache_path}")
+        with open(cache_path, "rb") as f:
+            return pickle.load(f)
+
+    df = _load_csv_dir(raw_dir)
+    df = _remove_duplicates(df)
+    X, y, scaler = preprocess(df, config.CIC2017_LABEL_MAP)
+
+    train, val, test = temporally_split(X, y)
+
+    payload = {"train": train, "val": val, "test": test, "scaler": scaler}
+    os.makedirs(proc_dir, exist_ok=True)
+    with open(cache_path, "wb") as f:
+        pickle.dump(payload, f)
+    log.info(f"Saved processed splits to {cache_path}")
+    return payload
+
+
+# ─── PyTorch Dataset ─────────────────────────────────────────────────────────
+
+class IDSDataset(Dataset):
+    """
+    PyTorch Dataset wrapping preprocessed CICFlowMeter feature arrays.
+
+    The CA-GRT model expects a sequence of length T_seq (Section IV-A-2, p95
+    of flow lengths = 100). For flow-level data each sample is a single vector;
+    we replicate it to form a dummy sequence so the BiGRU encoder receives
+    a proper (batch, seq_len, feat_dim) tensor. In production, replace with
+    actual per-packet sequences if raw PCAP access is available.
+
+    Packet-domain features  p: first d_p dims of the 80-feature vector
+    Semantic-domain features s: remaining d_s dims                       (Eq. 9-10)
     """
 
     def __init__(self, X: np.ndarray, y: np.ndarray,
-                 seq_len: int = None, augment: bool = False):
-        self.seq_len = seq_len or CAGRT["sequence_length"]
-        self.augment = augment
-        self.X = torch.from_numpy(X)           # (N, 80)
-        self.y = torch.from_numpy(y)           # (N,)
+                 seq_len: int = config.CAGRT_SEQ_LEN,
+                 packet_dim: int = config.CAGRT_PACKET_FEAT_DIM,
+                 semantic_dim: int = config.CAGRT_SEMANTIC_FEAT_DIM):
+        self.X = torch.from_numpy(X).float()
+        self.y = torch.from_numpy(y).long()
+        self.seq_len    = seq_len
+        self.packet_dim = packet_dim
+        self.semantic_dim = semantic_dim
 
     def __len__(self):
-        return len(self.y)
+        return len(self.X)
 
     def __getitem__(self, idx):
-        x = self.X[idx]                        # (80,)
-        if self.augment:
-            x = x + 0.01 * torch.randn_like(x)  # light Gaussian noise augmentation
+        x = self.X[idx]                          # (80,)
+        p = x[:self.packet_dim]                  # (d_p,)
+        s = x[self.packet_dim:]                  # (d_s,)
 
-        # Section III-C: split into packet-domain and semantic-domain features
-        half = x.shape[0] // 2
-        p = x[:half]     # packet-domain   (40,)
-        s = x[half:]     # semantic-domain (40,)
-
-        # Expand to sequence dimension: repeat along time axis
-        p_seq = p.unsqueeze(0).expand(self.seq_len, -1)   # (T, 40)
-        s_seq = s.unsqueeze(0).expand(self.seq_len, -1)   # (T, 40)
+        # Replicate single feature vector into sequence: (seq_len, feat_dim)
+        p_seq = p.unsqueeze(0).expand(self.seq_len, -1)  # (T, d_p)
+        s_seq = s.unsqueeze(0).expand(self.seq_len, -1)  # (T, d_s)
 
         return p_seq, s_seq, self.y[idx]
 
 
-# ─── Full pipeline builder ────────────────────────────────────────────────────
-def build_dataloaders(data_dir: str = None, batch_size: int = None,
-                      num_workers: int = None):
-    """
-    End-to-end: load → preprocess → split → DataLoaders.
-    Returns (train_loader, val_loader, test_loader, scaler, encoder)
-    """
-    batch_size  = batch_size  or TRAIN["batch_size"]
-    num_workers = num_workers or TRAIN["num_workers"]
+def get_dataloaders(train_split, val_split, test_split,
+                    batch_size=config.BATCH_SIZE, num_workers=4):
+    """Return train, val, and test DataLoaders."""
+    X_train, y_train = train_split
+    X_val,   y_val   = val_split
+    X_test,  y_test  = test_split
 
-    df = load_cicids2017(data_dir)
-    X, y, scaler, encoder = preprocess(df, fit=True)
+    train_ds = IDSDataset(X_train, y_train)
+    val_ds   = IDSDataset(X_val,   y_val)
+    test_ds  = IDSDataset(X_test,  y_test)
 
-    n = len(y)
-    idx = np.arange(n)
-    idx_train, idx_test = train_test_split(
-        idx, test_size=TEST_RATIO, random_state=RANDOM_SEED, stratify=y
-    )
-    idx_train, idx_val = train_test_split(
-        idx_train,
-        test_size=VAL_RATIO / (TRAIN_RATIO + VAL_RATIO),
-        random_state=RANDOM_SEED,
-        stratify=y[idx_train],
-    )
-
-    print(f"Split — train: {len(idx_train):,}  val: {len(idx_val):,}  "
-          f"test: {len(idx_test):,}")
-
-    # Scale using training statistics only
-    scaler_fit = StandardScaler().fit(X[idx_train])
-    X_train = scaler_fit.transform(X[idx_train]).astype(np.float32)
-    X_val   = scaler_fit.transform(X[idx_val]).astype(np.float32)
-    X_test  = scaler_fit.transform(X[idx_test]).astype(np.float32)
-
-    ds_train = CICIDSDataset(X_train, y[idx_train], augment=True)
-    ds_val   = CICIDSDataset(X_val,   y[idx_val],   augment=False)
-    ds_test  = CICIDSDataset(X_test,  y[idx_test],  augment=False)
-
-    kwargs = dict(batch_size=batch_size, num_workers=num_workers,
-                  pin_memory=TRAIN["pin_memory"])
-    train_loader = DataLoader(ds_train, shuffle=True,  **kwargs)
-    val_loader   = DataLoader(ds_val,   shuffle=False, **kwargs)
-    test_loader  = DataLoader(ds_test,  shuffle=False, **kwargs)
-
-    return train_loader, val_loader, test_loader, scaler_fit, encoder
-
-
-if __name__ == "__main__":
-    download_cicids2017()
+    train_loader = DataLoader(train_ds, batch_size=batch_size,
+                              shuffle=True,  num_workers=num_workers,
+                              pin_memory=True, drop_last=True)
+    val_loader   = DataLoader(val_ds,   batch_size=batch_size,
+                              shuffle=False, num_workers=num_workers,
+                              pin_memory=True)
+    test_loader  = DataLoader(test_ds,  batch_size=batch_size,
+                              shuffle=False, num_workers=num_workers,
+                              pin_memory=True)
+    return train_loader, val_loader, test_loader

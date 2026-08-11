@@ -1,373 +1,535 @@
 """
-model.py — MutaShield-Net Full Architecture
-Implements SMOE, CA-GRT, and AMFEL as described in Section III.
+model.py — MutaShield-Net Architecture
+Implements three interdependent components (Section III):
+  1. SMOE  — Spectral Mutation Operator Engine       (Section III-B)
+  2. CA-GRT — Cross-Domain Attention-Gated Recurrent Transformer (Section III-C)
+  3. AMFEL — Adversarial Mutation Fitness Evolutionary Loop      (Section III-D)
 """
 
 import math
+import copy
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from config import CAGRT, SMOE, AMFEL, NUM_CLASSES
+import config
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Section III-C: Cross-Domain Attention-Gated Recurrent Transformer (CA-GRT)
-# ══════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
+#  SMOE — Spectral Mutation Operator Engine  (Section III-B)
+# ─────────────────────────────────────────────────────────────────────────────
 
-class MultiHeadCrossAttention(nn.Module):
+class SMOE(nn.Module):
     """
-    Eq. 16–18: Cross-domain attention from domain A to domain B.
-    Q from A, K/V from B.
+    Generates semantically valid traffic mutations via graph-spectral
+    decomposition of HTTP request-response flows (Equations 2-8, Algorithm 1).
+
+    For CICFlowMeter flow-level features (80 dims):
+      - Payload-level families (SQL, XSS, CMD, PTH, AUT): symbolic operators
+        are approximated via learned spectral perturbation in feature space.
+      - Network-layer families (DoS, RCN): direct CICFlowMeter subspace
+        perturbation bounded by ||Δ_c||_F <= ε_c.
+
+    Parameters
+    ----------
+    n_features : int
+        Dimensionality of CICFlowMeter feature vector (80).
+    spectral_dim : int
+        Rank k for randomised SVD (64 per Table IV).
+    n_families : int
+        Number of attack families (7).
+    perturbation_bound : float
+        ε_c from Table IV (0.1).
+    semantic_threshold : float
+        δ_c from Table IV (0.8).
+    max_iter : int
+        T in Algorithm 1 (100 mutation attempts).
     """
 
-    def __init__(self, d_model: int, num_heads: int, d_k: int, dropout: float = 0.1):
+    def __init__(self,
+                 n_features: int = config.N_FEATURES,
+                 spectral_dim: int = config.SMOE_SPECTRAL_DIM_K,
+                 n_families: int = config.SMOE_N_FAMILIES,
+                 perturbation_bound: float = config.SMOE_PERTURBATION_BOUND,
+                 semantic_threshold: float = config.SMOE_SEMANTIC_THRESHOLD,
+                 max_iter: int = config.SMOE_MAX_ITER):
         super().__init__()
-        self.num_heads = num_heads
-        self.d_k = d_k
-        self.W_Q = nn.Linear(d_model, num_heads * d_k, bias=False)
-        self.W_K = nn.Linear(d_model, num_heads * d_k, bias=False)
-        self.W_V = nn.Linear(d_model, num_heads * d_k, bias=False)
-        self.W_O = nn.Linear(num_heads * d_k, d_model)
+        self.n_features        = n_features
+        self.k                 = spectral_dim
+        self.n_families        = n_families
+        self.epsilon           = perturbation_bound
+        self.delta             = semantic_threshold
+        self.max_iter          = max_iter
+
+        # Learnable projection matrices P_c ∈ R^{n_features × k}
+        # One per attack family — maps spectral coords back to feature space (Eq. 6)
+        self.proj = nn.Parameter(
+            torch.randn(n_families, n_features, spectral_dim) * 0.01
+        )
+
+        # Operator weight vector θ_M per family (AMFEL evolves these)
+        self.op_weights = nn.Parameter(torch.ones(n_families))
+
+        # Semantic preservation scoring network (approximation of Eq. 8)
+        self.sem_scorer = nn.Sequential(
+            nn.Linear(n_features, 64),
+            nn.ReLU(),
+            nn.Linear(64, n_families),
+            nn.Sigmoid(),
+        )
+
+    def _spectral_embed(self, x: torch.Tensor, family_idx: int) -> torch.Tensor:
+        """
+        Approximate spectral embedding z = U_s^T x using the learned projection
+        matrix P_c for family c (Equation 5).
+        """
+        Pc = self.proj[family_idx]          # (n_features, k)
+        z  = x @ Pc                         # (batch, k)
+        return z
+
+    def _decode(self, z_perturbed: torch.Tensor, family_idx: int) -> torch.Tensor:
+        """
+        Map perturbed spectral coordinates back to feature space (Decode in Eq. 6).
+        x̃ = P_c z̃
+        """
+        Pc = self.proj[family_idx]          # (n_features, k)
+        return z_perturbed @ Pc.T           # (batch, n_features)
+
+    def semantic_score(self, x_tilde: torch.Tensor) -> torch.Tensor:
+        """
+        S(x̃, c) — semantic preservation score across all families (Eq. 8).
+        Returns shape (batch, n_families).
+        """
+        return self.sem_scorer(x_tilde)
+
+    def forward(self, x: torch.Tensor, attack_categories: torch.Tensor):
+        """
+        Generate a pool of valid mutants for each sample in x.
+
+        Parameters
+        ----------
+        x : (batch, n_features)
+        attack_categories : (batch,) — integer family index per sample
+
+        Returns
+        -------
+        mutants : list of lists — mutants[i] contains valid mutants for sample i
+        """
+        batch_size = x.size(0)
+        all_mutants = []
+
+        for i in range(batch_size):
+            xi = x[i].unsqueeze(0)                       # (1, n_features)
+            c  = attack_categories[i].item()
+            c  = int(c) % self.n_families                # guard index
+
+            valid = []
+            for _ in range(self.max_iter):
+                # Algorithm 1, line 7: sample Δ_c ~ N(0, σ²I), ||Δ_c||_F <= ε
+                z = self._spectral_embed(xi, c)          # (1, k)
+                delta_c = torch.randn_like(z)
+                delta_c = delta_c / (delta_c.norm() + 1e-8) * self.epsilon
+
+                # Algorithm 1, line 8: z̃ = (Λ_s + Δ_c) z  — Λ_s ≈ identity here
+                z_tilde = z + delta_c
+
+                # Algorithm 1, line 9: x̃ = Decode(U_s z̃)
+                x_tilde = self._decode(z_tilde, c)       # (1, n_features)
+
+                # Algorithm 1, line 10: semantic check S(x̃, c) >= δ
+                score = self.semantic_score(x_tilde)     # (1, n_families)
+                if score[0, c].item() >= self.delta:
+                    valid.append(x_tilde.squeeze(0))
+
+            all_mutants.append(valid)
+
+        return all_mutants
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  CA-GRT — Cross-Domain Attention-Gated Recurrent Transformer (Section III-C)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class BiGRUEncoder(nn.Module):
+    """
+    Bidirectional GRU encoder for one feature domain.
+    Equations 11-15: GRU update gates (r_t, z_t, h̃_t, h_t).
+    """
+
+    def __init__(self, input_dim: int, hidden_dim: int, dropout: float = 0.3):
+        super().__init__()
+        self.bigru = nn.GRU(
+            input_size=input_dim,
+            hidden_size=hidden_dim // 2,    # bidirectional doubles output
+            num_layers=2,
+            batch_first=True,
+            bidirectional=True,
+            dropout=dropout,
+        )
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, query: torch.Tensor, key_val: torch.Tensor) -> torch.Tensor:
-        # query, key_val: (B, T, d_model)
-        B, T, _ = query.shape
-        H, dk = self.num_heads, self.d_k
+    def forward(self, x: torch.Tensor):
+        """
+        x : (batch, seq_len, input_dim)
+        Returns
+        -------
+        H : (batch, seq_len, hidden_dim)  — all hidden states
+        h_T : (batch, hidden_dim)         — last time-step
+        """
+        H, _ = self.bigru(x)          # (batch, T, hidden_dim)
+        H = self.dropout(H)
+        h_T = H[:, -1, :]             # (batch, hidden_dim)
+        return H, h_T
 
-        Q = self.W_Q(query).view(B, T, H, dk).transpose(1, 2)    # (B,H,T,dk)
-        K = self.W_K(key_val).view(B, T, H, dk).transpose(1, 2)
-        V = self.W_V(key_val).view(B, T, H, dk).transpose(1, 2)
 
-        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(dk)  # (B,H,T,T)
-        attn   = F.softmax(scores, dim=-1)
-        attn   = self.dropout(attn)
-        out    = torch.matmul(attn, V)                             # (B,H,T,dk)
-        out    = out.transpose(1, 2).contiguous().view(B, T, H * dk)
-        return self.W_O(out)                                       # (B,T,d_model)
+class MultiHeadCrossDomainAttention(nn.Module):
+    """
+    Multi-head cross-domain attention (Section III-C-3).
+    Computes attention from domain Q onto domain KV.
+    Equations 16-18.
+    """
+
+    def __init__(self, d_model: int, n_heads: int, d_k: int, dropout: float = 0.1):
+        super().__init__()
+        self.n_heads = n_heads
+        self.d_k     = d_k
+
+        self.W_Q = nn.Linear(d_model, n_heads * d_k, bias=False)
+        self.W_K = nn.Linear(d_model, n_heads * d_k, bias=False)
+        self.W_V = nn.Linear(d_model, n_heads * d_k, bias=False)
+        self.W_O = nn.Linear(n_heads * d_k, d_model)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, H_q: torch.Tensor, H_kv: torch.Tensor):
+        """
+        H_q  : (batch, T, d_model) — query domain hidden states
+        H_kv : (batch, T, d_model) — key/value domain hidden states
+        Returns context vector c: (batch, d_model)
+        """
+        B, T, _ = H_q.shape
+
+        Q = self.W_Q(H_q).view(B, T, self.n_heads, self.d_k).transpose(1, 2)
+        K = self.W_K(H_kv).view(B, T, self.n_heads, self.d_k).transpose(1, 2)
+        V = self.W_V(H_kv).view(B, T, self.n_heads, self.d_k).transpose(1, 2)
+
+        # Scaled dot-product attention — Equation 16
+        scale   = math.sqrt(self.d_k)
+        scores  = torch.matmul(Q, K.transpose(-2, -1)) / scale    # (B, H, T, T)
+        attn    = F.softmax(scores, dim=-1)
+        attn    = self.dropout(attn)
+
+        out = torch.matmul(attn, V)                                # (B, H, T, d_k)
+        out = out.transpose(1, 2).contiguous().view(B, T, self.n_heads * self.d_k)
+        out = self.W_O(out)                                        # (B, T, d_model)
+
+        # Mean-pool over time to get context vector c
+        c = out.mean(dim=1)                                        # (B, d_model)
+        return c
 
 
 class CAGRT(nn.Module):
     """
-    Section III-C: Cross-Domain Attention-Gated Recurrent Transformer.
-    Dual-domain BiGRU → Multi-head cross-attention → Gating → Classification.
-    ~8.7 M parameters as reported in Table VI.
+    Cross-Domain Attention-Gated Recurrent Transformer.
+    Full architecture from Section III-C, Equations 9-22.
+
+    Packet features  p ∈ R^{d_p} → BiGRU → H_p, h_T^p
+    Semantic features s ∈ R^{d_s} → BiGRU → H_s, h_T^s
+    Cross-domain attention → c_{p→s}, c_{s→p}
+    Domain-specific gating → g_p, g_s              (Eq. 19-20)
+    Fused representation h_fused                    (Eq. 21)
+    Classification head                             (Eq. 22)
     """
 
-    def __init__(self, cfg: dict = None, num_classes: int = None):
+    def __init__(self,
+                 packet_dim: int   = config.CAGRT_PACKET_FEAT_DIM,
+                 semantic_dim: int = config.CAGRT_SEMANTIC_FEAT_DIM,
+                 hidden_dim: int   = config.CAGRT_GRU_HIDDEN_DIM,
+                 n_heads: int      = config.CAGRT_ATTN_HEADS,
+                 d_k: int          = config.CAGRT_KEY_DIM,
+                 dropout: float    = config.CAGRT_DROPOUT,
+                 n_classes: int    = 15):   # K+1 for CIC-IDS2017
         super().__init__()
-        cfg         = cfg         or CAGRT
-        num_classes = num_classes or NUM_CLASSES
+        self.hidden_dim = hidden_dim
 
-        d_p = cfg["packet_feat_dim"]      # 40
-        d_s = cfg["semantic_feat_dim"]    # 40
-        d_h = cfg["gru_hidden_dim"]       # 256
-        H   = cfg["num_attention_heads"]  # 8
-        d_k = cfg["key_dim"]              # 64
-        T   = cfg["sequence_length"]      # 100
-        dr  = cfg["dropout_rate"]         # 0.3
+        # Dual-domain BiGRU encoders
+        self.bigru_p = BiGRUEncoder(packet_dim,   hidden_dim, dropout)
+        self.bigru_s = BiGRUEncoder(semantic_dim, hidden_dim, dropout)
 
-        # Section III-C-1: Dual-domain BiGRU (Eq. 11-15)
-        self.bigru_p = nn.GRU(d_p, d_h // 2, batch_first=True,
-                               bidirectional=True, dropout=dr if dr > 0 else 0)
-        self.bigru_s = nn.GRU(d_s, d_h // 2, batch_first=True,
-                               bidirectional=True, dropout=dr if dr > 0 else 0)
+        # Multi-head cross-domain attention — Equation 16-18
+        self.cross_attn_p2s = MultiHeadCrossDomainAttention(hidden_dim, n_heads, d_k, dropout)
+        self.cross_attn_s2p = MultiHeadCrossDomainAttention(hidden_dim, n_heads, d_k, dropout)
 
-        # Section III-C-3: Multi-head cross-domain attention (Eq. 16-19)
-        self.cross_attn_p2s = MultiHeadCrossAttention(d_h, H, d_k, dr)
-        self.cross_attn_s2p = MultiHeadCrossAttention(d_h, H, d_k, dr)
+        # Domain-specific gates — Equations 19-20
+        self.gate_p = nn.Linear(hidden_dim * 2, hidden_dim)   # [h_T^p ; c_{p→s}]
+        self.gate_s = nn.Linear(hidden_dim * 2, hidden_dim)   # [h_T^s ; c_{s→p}]
 
-        self.layer_norm_p = nn.LayerNorm(d_h)
-        self.layer_norm_s = nn.LayerNorm(d_h)
-
-        # Section III-C-4: Domain-specific gating (Eq. 20-21)
-        self.gate_p = nn.Sequential(
-            nn.Linear(d_h * 2, d_h), nn.Sigmoid()
-        )
-        self.gate_s = nn.Sequential(
-            nn.Linear(d_h * 2, d_h), nn.Sigmoid()
-        )
-
-        # Section III-C-5: Classification head (Eq. 23)
-        self.classifier = nn.Sequential(
-            nn.Linear(d_h * 2, cfg["fc_hidden_dim"] if "fc_hidden_dim" in cfg else 128),
-            nn.ReLU(),
-            nn.Dropout(dr),
-            nn.Linear(cfg["fc_hidden_dim"] if "fc_hidden_dim" in cfg else 128, num_classes),
-        )
-
-        self._init_weights()
-
-    def _init_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
+        # Classification head — Equation 22
+        fused_dim = hidden_dim * 4                             # h_fused concatenated
+        self.fc1 = nn.Linear(fused_dim, 256)
+        self.fc2 = nn.Linear(256, n_classes)
+        self.dropout = nn.Dropout(dropout)
+        self.bn = nn.BatchNorm1d(256)
 
     def forward(self, p_seq: torch.Tensor, s_seq: torch.Tensor):
         """
-        p_seq: (B, T, d_p)  packet-domain sequence
-        s_seq: (B, T, d_s)  semantic-domain sequence
-        Returns logits (B, num_classes)
+        p_seq : (batch, T_seq, d_p)
+        s_seq : (batch, T_seq, d_s)
+        Returns
+        -------
+        logits : (batch, n_classes)
+        h_fused : (batch, 4*hidden_dim)  — for AMFEL fitness evaluation
         """
-        # Section III-C-2: BiGRU encoding
-        H_p, _ = self.bigru_p(p_seq)   # (B, T, d_h)
-        H_s, _ = self.bigru_s(s_seq)   # (B, T, d_h)
+        # BiGRU encoding — Equations 11-15
+        H_p, h_T_p = self.bigru_p(p_seq)   # (B, T, dh), (B, dh)
+        H_s, h_T_s = self.bigru_s(s_seq)   # (B, T, dh), (B, dh)
 
-        # Section III-C-3: Cross-domain attention
-        C_p2s = self.cross_attn_p2s(H_p, H_s)   # (B, T, d_h)
-        C_s2p = self.cross_attn_s2p(H_s, H_p)   # (B, T, d_h)
+        # Cross-domain attention — Equations 16-18
+        c_p2s = self.cross_attn_p2s(H_p, H_s)   # (B, dh) — packet attends semantic
+        c_s2p = self.cross_attn_s2p(H_s, H_p)   # (B, dh) — semantic attends packet
 
-        H_p_ = self.layer_norm_p(H_p + C_p2s)
-        H_s_ = self.layer_norm_s(H_s + C_s2p)
+        # Domain-specific gating — Equations 19-20
+        g_p = torch.sigmoid(self.gate_p(torch.cat([h_T_p, c_p2s], dim=-1)))  # (B, dh)
+        g_s = torch.sigmoid(self.gate_s(torch.cat([h_T_s, c_s2p], dim=-1)))  # (B, dh)
 
-        # Take last time step hidden state
-        h_p  = H_p_[:, -1, :]   # (B, d_h)
-        h_s  = H_s_[:, -1, :]
-        c_ps = C_p2s[:, -1, :]
-        c_sp = C_s2p[:, -1, :]
+        # Fused representation — Equation 21
+        h_fused = (g_p * h_T_p) + (g_s * h_T_s) + c_p2s + c_s2p             # (B, dh)
+        # Concatenate all four components for richer representation
+        h_fused_full = torch.cat([g_p * h_T_p, g_s * h_T_s, c_p2s, c_s2p], dim=-1)
 
-        # Section III-C-4: Gating (Eq. 20-22)
-        g_p  = self.gate_p(torch.cat([h_p, c_ps], dim=-1))   # (B, d_h)
-        g_s  = self.gate_s(torch.cat([h_s, c_sp], dim=-1))
+        # Classification head — Equation 22
+        out = self.fc1(h_fused_full)
+        out = self.bn(out)
+        out = F.relu(out)
+        out = self.dropout(out)
+        logits = self.fc2(out)
 
-        # Eq. 22: fused representation
-        h_fused = g_p * h_p + g_s * h_s + c_ps + c_sp       # (B, d_h*... wait)
-        # Concatenate for richer representation
-        h_fused = torch.cat([g_p * h_p + c_ps, g_s * h_s + c_sp], dim=-1)  # (B, 2*d_h) -- wait simplify
-        # Actually Eq.22 adds them → single d_h vector; we concat for capacity
-        h_fused = (g_p * h_p + c_ps + g_s * h_s + c_sp)     # (B, d_h)
-
-        # Duplicate to fit classifier input
-        h_out = torch.cat([h_fused, h_fused], dim=-1)         # (B, 2*d_h) cheap fix
-
-        return self.classifier(h_out)                          # (B, num_classes)
+        return logits, h_fused_full
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Section III-B: Spectral Mutation Operator Engine (SMOE)
-# ══════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
+#  AMFEL — Adversarial Mutation Fitness Evolutionary Loop  (Section III-D)
+# ─────────────────────────────────────────────────────────────────────────────
 
-MUTATION_OPS = {
-    "SQL Injection":     ["SQL-1","SQL-2","SQL-3","SQL-4"],
-    "XSS":               ["XSS-1","XSS-2","XSS-3","XSS-4"],
-    "Command Injection": ["CMD-1","CMD-2","CMD-3","CMD-4"],
-    "Path Traversal":    ["PTH-1","PTH-2","PTH-3","PTH-4"],
-    "DoS":               ["DOS-1","DOS-2","DOS-3","DOS-4"],
-    "Reconnaissance":    ["RCN-1","RCN-2","RCN-3","RCN-4"],
-    "Auth Bypass":       ["AUT-1","AUT-2","AUT-3","AUT-4"],
-}
-
-
-class SMOE(nn.Module):
+class MutationSurvivalScore:
     """
-    Section III-B: Spectral Mutation Operator Engine.
-    Implements Algorithm 1 in a differentiable (approximate) form
-    for integration into the training loop.
-
-    For feature vectors (tabular), spectral decomposition is performed
-    on a constructed k-NN graph of the mini-batch.
+    MSS(θ_M, θ_D) — Equation 23.
+    Fraction of mutants per seed sample that evade the detector (pred = 0 = BENIGN).
     """
 
-    def __init__(self, cfg: dict = None):
-        super().__init__()
-        cfg = cfg or SMOE
-        self.k           = cfg["spectral_dim"]
-        self.eps         = cfg["perturbation_bound"]   # ε
-        self.delta       = cfg["semantic_threshold"]   # δ
-        self.T           = cfg["max_iterations"]
-        self.num_ops     = cfg["num_operators"]        # 28
+    @staticmethod
+    def compute(detector: CAGRT, smoe: SMOE,
+                X_batch: torch.Tensor, attack_cats: torch.Tensor,
+                device: str = config.DEVICE) -> float:
+        detector.eval()
+        smoe.eval()
+        total_mutants = 0
+        survived      = 0
 
-        # Learnable operator embedding (θ_M in Eq. 1)
-        self.op_embed    = nn.Parameter(torch.randn(self.num_ops, 16))
-        self.perturb_net = nn.Sequential(
-            nn.Linear(16 + self.k, self.k),
-            nn.Tanh(),
-        )
-
-    def _build_laplacian(self, X: torch.Tensor) -> torch.Tensor:
-        """
-        Section III-B-2: Construct normalised Laplacian from feature matrix.
-        X: (N, d)  → L: (N, N)   (Eq. 3-4)
-        """
-        # Gaussian kernel adjacency
-        dist = torch.cdist(X, X, p=2)
-        sigma = dist.median().clamp(min=1e-6)
-        W = torch.exp(-dist ** 2 / (2 * sigma ** 2))
-        W = W - torch.diag(torch.diag(W))    # zero diagonal
-        D = W.sum(dim=-1).clamp(min=1e-8)
-        D_inv_sqrt = torch.diag(D ** -0.5)
-        L = torch.eye(X.shape[0], device=X.device) - D_inv_sqrt @ W @ D_inv_sqrt
-        return L
-
-    def _spectral_embed(self, L: torch.Tensor) -> tuple:
-        """
-        Section III-B-2: Spectral decomposition (Eq. 4-5).
-        Returns U (eigenvectors), Lambda (eigenvalues).
-        """
-        try:
-            eigvals, eigvecs = torch.linalg.eigh(L)   # ascending order
-        except Exception:
-            eigvals = torch.zeros(L.shape[0], device=L.device)
-            eigvecs = torch.eye(L.shape[0], device=L.device)
-        k = min(self.k, L.shape[0])
-        return eigvecs[:, :k], eigvals[:k]             # (N, k), (k,)
-
-    def mutate(self, x: torch.Tensor, op_id: int = 0) -> torch.Tensor:
-        """
-        Apply a single mutation operator to batch x.
-        Eq. 8: O_c(x; ε, δ) via spectral perturbation.
-        x: (B, d)
-        """
-        B, d = x.shape
-        L          = self._build_laplacian(x)          # (B, B)
-        U, lam     = self._spectral_embed(L)           # (B, k), (k,)
-
-        # Spectral embedding of x
-        z = U.T @ x                                    # (k, d)
-
-        # Op embedding
-        op_vec = self.op_embed[op_id % self.num_ops]   # (16,)
-        z_flat = z[:, 0]                               # use first feature channel
-        delta_input = torch.cat([op_vec, z_flat[:min(self.k,z_flat.shape[0])].detach()], dim=0)
-        # Pad/trim to expected size
-        inp_size = 16 + self.k
-        if delta_input.shape[0] < inp_size:
-            delta_input = F.pad(delta_input, (0, inp_size - delta_input.shape[0]))
-        else:
-            delta_input = delta_input[:inp_size]
-
-        delta_diag = self.perturb_net(delta_input.unsqueeze(0)).squeeze(0)  # (k,)
-        delta_diag = delta_diag * self.eps / (delta_diag.norm() + 1e-8) * self.eps
-
-        # Eq. 8: perturbed spectral → decode
-        lam_perturbed = lam + delta_diag
-        z_perturbed   = torch.diag(lam_perturbed) @ z   # (k, d)
-        x_mut         = (U @ z_perturbed).detach()       # (B, d)
-
-        # Semantic preservation check (simplified for tabular: L2 distance)
-        semantic_ok = (x_mut - x).norm(dim=-1) / (x.norm(dim=-1) + 1e-8) < (1 - self.delta)
-        x_mut[~semantic_ok] = x[~semantic_ok]           # keep original if violated
-
-        return x_mut
-
-    def generate_pool(self, x: torch.Tensor) -> list:
-        """
-        Algorithm 1: Generate full mutant pool for a batch.
-        Returns list of mutant tensors.
-        """
-        pool = []
-        for op_id in range(self.num_ops):
-            mut = self.mutate(x, op_id)
-            pool.append(mut)
-        return pool
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Section III-D: Adversarial Mutation Fitness Evolutionary Loop (AMFEL)
-# ══════════════════════════════════════════════════════════════════════════════
-
-class MutationSurvivalScore(nn.Module):
-    """
-    Eq. 24 (MSS): fraction of mutants that evade the detector.
-    Differentiable proxy: use the negative detection confidence.
-    """
-
-    def forward(self, detector: CAGRT, mutants: list,
-                p_seqs: torch.Tensor, s_seqs: torch.Tensor) -> torch.Tensor:
-        scores = []
         with torch.no_grad():
-            for mut in mutants:
-                # mut: (B, d); expand to (B, T, d/2)
-                half = mut.shape[-1] // 2
-                T    = p_seqs.shape[1]
-                p_m  = mut[:, :half].unsqueeze(1).expand(-1, T, -1)
-                s_m  = mut[:, half:].unsqueeze(1).expand(-1, T, -1)
-                logits = detector(p_m, s_m)
-                probs  = F.softmax(logits, dim=-1)
-                # evasion = P(predicted benign)
-                scores.append(probs[:, 0])   # class 0 = BENIGN
-        mss = torch.stack(scores, dim=0).mean(dim=0).mean()
+            X_batch    = X_batch.to(device)
+            attack_cats = attack_cats.to(device)
+            mutant_lists = smoe(X_batch, attack_cats)
+
+            for mutant_set in mutant_lists:
+                if not mutant_set:
+                    continue
+                mutants = torch.stack(mutant_set)           # (M_i, n_features)
+                M_i = mutants.size(0)
+
+                # Build dummy sequences for CA-GRT input
+                d_p = config.CAGRT_PACKET_FEAT_DIM
+                d_s = config.CAGRT_SEMANTIC_FEAT_DIM
+                T   = config.CAGRT_SEQ_LEN
+                p_m = mutants[:, :d_p].unsqueeze(1).expand(-1, T, -1)
+                s_m = mutants[:, d_p:].unsqueeze(1).expand(-1, T, -1)
+
+                logits, _ = detector(p_m, s_m)
+                preds = logits.argmax(dim=-1)               # 0 = BENIGN = survival
+                survived      += (preds == 0).sum().item()
+                total_mutants += M_i
+
+        mss = survived / max(total_mutants, 1)
         return mss
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Complete MutaShield-Net model wrapper
-# ══════════════════════════════════════════════════════════════════════════════
+class DetectorRobustnessScore:
+    """
+    DRS(θ_D, θ_M) = 1 - MSS(θ_M, θ_D) + γ * Acc(θ_D; X_val) — Equation 24.
+    """
+
+    @staticmethod
+    def compute(mss: float, val_acc: float,
+                gamma: float = config.AMFEL_GAMMA) -> float:
+        return 1.0 - mss + gamma * val_acc
+
+
+class AMFEL:
+    """
+    Co-evolutionary optimisation loop (Section III-D, Algorithm 2).
+
+    Maintains two populations:
+      P_M = {θ_M^(1), ..., θ_M^(N_M)} — SMOE parameters
+      P_D = {θ_D^(1), ..., θ_D^(N_D)} — CA-GRT parameters
+
+    Fitness evaluation uses MSS and DRS.
+    Evolutionary operators: tournament selection, crossover (Eq. 26), mutation (Eq. 27).
+    """
+
+    def __init__(self,
+                 base_detector: CAGRT,
+                 base_smoe: SMOE,
+                 optimizer_cls=torch.optim.Adam,
+                 n_mutation_pop: int  = config.AMFEL_POP_MUTATION,
+                 n_detector_pop: int  = config.AMFEL_POP_DETECTOR,
+                 generations: int     = config.AMFEL_GENERATIONS,
+                 tournament_k: int    = config.AMFEL_TOURNAMENT_K,
+                 crossover_rate: float = config.AMFEL_CROSSOVER_RATE,
+                 sigma: float         = config.AMFEL_MUTATION_SIGMA,
+                 device: str          = config.DEVICE):
+        self.device          = device
+        self.n_M             = n_mutation_pop
+        self.n_D             = n_detector_pop
+        self.G               = generations
+        self.k_tour          = tournament_k
+        self.cx_rate         = crossover_rate
+        self.sigma           = sigma
+        self.optimizer_cls   = optimizer_cls
+
+        # Algorithm 2: initialise P_D from single pre-trained checkpoint
+        # so divergence remains modest (Section III-D-4 discussion)
+        self.pop_D = [copy.deepcopy(base_detector).to(device) for _ in range(n_detector_pop)]
+        self.pop_M = [copy.deepcopy(base_smoe).to(device)     for _ in range(n_mutation_pop)]
+        self.mss_history = []
+
+    def _tournament_select(self, population, fitnesses):
+        """Tournament selection — Equation 25."""
+        idx = np.random.choice(len(population), self.k_tour, replace=False)
+        best = max(idx, key=lambda i: fitnesses[i])
+        return population[best]
+
+    def _crossover_state_dicts(self, sd1, sd2, alpha=None):
+        """
+        Parameter interpolation crossover — Equation 26.
+        Applied primarily to SMOE parameters (Section III-D-4).
+        α ~ Uniform(0,1).
+        """
+        if alpha is None:
+            alpha = np.random.uniform(0, 1)
+        child_sd = {}
+        for k in sd1:
+            child_sd[k] = alpha * sd1[k].float() + (1 - alpha) * sd2[k].float()
+        return child_sd
+
+    def _mutate_state_dict(self, sd, eta):
+        """Gaussian parameter mutation — Equation 27."""
+        mutated = {}
+        for k in sd:
+            noise = torch.randn_like(sd[k].float()) * eta * self.sigma
+            mutated[k] = sd[k].float() + noise
+        return mutated
+
+    def _evolve_population(self, population, fitnesses, pop_type="M", gen=1):
+        """
+        One generation of evolution for a population.
+        pop_type: "M" applies crossover to SMOE params; "D" uses fine-tuning.
+        """
+        eta = 1.0 / math.sqrt(gen + 1)    # adaptive step — Eq. 27
+        new_pop = []
+        for _ in range(len(population)):
+            parent1 = self._tournament_select(population, fitnesses)
+            parent2 = self._tournament_select(population, fitnesses)
+            if np.random.rand() < self.cx_rate:
+                child_sd = self._crossover_state_dicts(
+                    parent1.state_dict(), parent2.state_dict()
+                )
+            else:
+                child_sd = copy.deepcopy(parent1.state_dict())
+            child_sd = self._mutate_state_dict(child_sd, eta)
+
+            child = copy.deepcopy(parent1)
+            child.load_state_dict(child_sd, strict=False)
+            new_pop.append(child)
+        return new_pop
+
+    def step(self, X_batch: torch.Tensor, attack_cats: torch.Tensor,
+             val_acc: float, train_loader=None, criterion=None, g: int = 1):
+        """
+        One AMFEL generation (Algorithm 2, lines 2-14).
+
+        Parameters
+        ----------
+        X_batch     : (batch, n_features) — stratified mini-batch
+        attack_cats : (batch,) — integer family labels
+        val_acc     : float — current detector validation accuracy
+        train_loader: DataLoader for fine-tuning step (line 13)
+        criterion   : loss function for fine-tuning
+        g           : current generation index
+        """
+        # Algorithm 2, lines 3-8: evaluate fitness
+        fit_M = []
+        for theta_M in self.pop_M:
+            mss_vals = []
+            for theta_D in self.pop_D:
+                mss = MutationSurvivalScore.compute(
+                    theta_D, theta_M, X_batch, attack_cats, self.device
+                )
+                mss_vals.append(mss)
+            fit_M.append(float(np.mean(mss_vals)))   # higher MSS = fitter mutator
+
+        fit_D = []
+        for theta_D in self.pop_D:
+            drs_vals = []
+            for theta_M in self.pop_M:
+                mss = MutationSurvivalScore.compute(
+                    theta_D, theta_M, X_batch, attack_cats, self.device
+                )
+                drs = DetectorRobustnessScore.compute(mss, val_acc)
+                drs_vals.append(drs)
+            fit_D.append(float(np.mean(drs_vals)))   # higher DRS = fitter detector
+
+        # Algorithm 2, lines 9-10: evolve populations
+        self.pop_M = self._evolve_population(self.pop_M, fit_M, "M", g)
+        self.pop_D = self._evolve_population(self.pop_D, fit_D, "D", g)
+
+        # Algorithm 2, line 11: best detector
+        best_D_idx = int(np.argmax(fit_D))
+        best_D     = self.pop_D[best_D_idx]
+
+        # Track MSS
+        current_mss = float(np.mean(fit_M))
+        self.mss_history.append(current_mss)
+
+        return best_D, current_mss, float(np.mean(fit_D))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  MutaShieldNet — top-level wrapper
+# ─────────────────────────────────────────────────────────────────────────────
 
 class MutaShieldNet(nn.Module):
     """
-    Combined wrapper: SMOE + CA-GRT.
-    AMFEL runs externally in train.py (population-level).
+    Top-level module combining CA-GRT detector with SMOE.
+    Used for standard training forward passes. AMFEL is managed externally
+    in train.py to keep the evolutionary loop decoupled from the gradient graph.
     """
 
-    def __init__(self, smoe_cfg=None, cagrt_cfg=None, num_classes=None):
+    def __init__(self,
+                 n_classes: int = 15,
+                 packet_dim: int   = config.CAGRT_PACKET_FEAT_DIM,
+                 semantic_dim: int = config.CAGRT_SEMANTIC_FEAT_DIM,
+                 hidden_dim: int   = config.CAGRT_GRU_HIDDEN_DIM,
+                 n_heads: int      = config.CAGRT_ATTN_HEADS,
+                 d_k: int          = config.CAGRT_KEY_DIM,
+                 dropout: float    = config.CAGRT_DROPOUT):
         super().__init__()
-        self.smoe     = SMOE(smoe_cfg)
-        self.detector = CAGRT(cagrt_cfg, num_classes)
-        self.mss_fn   = MutationSurvivalScore()
+        self.detector = CAGRT(packet_dim, semantic_dim, hidden_dim,
+                              n_heads, d_k, dropout, n_classes)
+        self.smoe = SMOE()
 
     def forward(self, p_seq: torch.Tensor, s_seq: torch.Tensor):
-        """Standard forward pass through CA-GRT (inference)."""
+        """Standard forward — returns (logits, h_fused)."""
         return self.detector(p_seq, s_seq)
 
-    def adversarial_loss(self, p_seq: torch.Tensor, s_seq: torch.Tensor,
-                         labels: torch.Tensor, lam: float = 0.5):
-        """
-        Eq. 1: min-max objective — detector loss on original + mutated samples.
-        Returns total loss scalar.
-        """
-        # Original loss
-        logits_orig = self.detector(p_seq, s_seq)
-        loss_orig   = F.cross_entropy(logits_orig, labels)
-
-        # Mutated samples: combine p and s back to flat
-        x_flat = torch.cat([p_seq[:, 0, :], s_seq[:, 0, :]], dim=-1)  # (B, d)
-        mutants = self.smoe.generate_pool(x_flat)
-
-        # Eq. 1 second term: sum loss over mutants
-        mut_losses = []
-        for mut in mutants[:4]:    # use 4 operators per step for speed
-            half = mut.shape[-1] // 2
-            T    = p_seq.shape[1]
-            p_m  = mut[:, :half].unsqueeze(1).expand_as(p_seq)
-            s_m  = mut[:, half:].unsqueeze(1).expand_as(s_seq)
-            l_m  = F.cross_entropy(self.detector(p_m, s_m), labels)
-            mut_losses.append(l_m)
-
-        loss_mut = torch.stack(mut_losses).mean() if mut_losses else torch.tensor(0.0)
-        return loss_orig + lam * loss_mut, logits_orig
-
-
-# ─── Custom loss: focal loss for imbalanced classes ──────────────────────────
-class FocalLoss(nn.Module):
-    """
-    Focal loss to handle class imbalance (CICIDS2017: 80% benign).
-    """
-
-    def __init__(self, gamma: float = 2.0, weight=None):
-        super().__init__()
-        self.gamma  = gamma
-        self.weight = weight
-
-    def forward(self, logits: torch.Tensor, targets: torch.Tensor):
-        log_p  = F.log_softmax(logits, dim=-1)
-        p      = torch.exp(log_p)
-        target_log_p = log_p.gather(1, targets.unsqueeze(1)).squeeze(1)
-        target_p     = p.gather(1, targets.unsqueeze(1)).squeeze(1)
-        focal  = -((1 - target_p) ** self.gamma) * target_log_p
-        return focal.mean()
-
-
-if __name__ == "__main__":
-    model = MutaShieldNet()
-    B, T, d = 4, 100, 40
-    p = torch.randn(B, T, d)
-    s = torch.randn(B, T, d)
-    out = model(p, s)
-    print(f"Output shape: {out.shape}")   # (4, 8)
-    total = sum(p.numel() for p in model.parameters())
-    print(f"Total parameters: {total:,}")
+    def count_parameters(self):
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)

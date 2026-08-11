@@ -1,145 +1,166 @@
 """
 inference.py — MutaShield-Net Single-Sample Inference
-Accepts a CSV row or a numpy feature vector and predicts the traffic class.
+Accepts a single 80-dimensional CICFlowMeter feature vector,
+runs CA-GRT detection, and outputs a prediction with confidence.
 """
 
-import os, sys
+import os
+import argparse
+import logging
+import json
 import numpy as np
 import torch
-import torch.nn.functional as F
 import matplotlib
-matplotlib.use('Agg')
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib import rcParams
+rcParams["font.family"] = "Times New Roman"
+rcParams["font.size"]   = 11
 
-from config  import BEST_CKPT, RESULTS_DIR, CAGRT, CLASS_NAMES, RANDOM_SEED
-from model   import MutaShieldNet
-from utils   import set_seed
+import config
+from model import MutaShieldNet
+
+logging.basicConfig(level=logging.INFO,
+                    format="%(levelname)s: %(message)s")
+log = logging.getLogger(__name__)
+
+# Human-readable class names for CIC-IDS2017 (15 classes including benign)
+CLASS_NAMES = {
+    0:  "BENIGN",
+    1:  "FTP-Patator",
+    2:  "SSH-Patator",
+    3:  "DoS-Slowloris",
+    4:  "DoS-Slowhttptest",
+    5:  "DoS-Hulk",
+    6:  "DoS-GoldenEye",
+    7:  "Heartbleed",
+    8:  "Web-BruteForce",
+    9:  "Web-XSS",
+    10: "Web-SQLi",
+    11: "Infiltration",
+    12: "Botnet",
+    13: "PortScan",
+    14: "DDoS",
+}
 
 
-def load_model(ckpt_path: str = BEST_CKPT, device=None):
-    if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if not os.path.exists(ckpt_path):
-        raise FileNotFoundError(
-            f"Checkpoint not found: {ckpt_path}\nRun train.py first."
-        )
-    model = MutaShieldNet().to(device)
-    ckpt  = torch.load(ckpt_path, map_location=device)
-    model.load_state_dict(ckpt["state_dict"])
+def load_model(ckpt_path: str, n_classes: int = 15, device: str = config.DEVICE):
+    model = MutaShieldNet(n_classes=n_classes).to(device)
+    ckpt  = torch.load(ckpt_path, map_location=device, weights_only=True)
+    model.load_state_dict(ckpt["model_state"])
     model.eval()
-    return model, device
+    return model
 
 
-def preprocess_sample(feature_vector: np.ndarray,
-                      scaler=None, seq_len: int = None) -> tuple:
+def preprocess_sample(raw_features: np.ndarray, scaler=None) -> tuple:
     """
-    Convert a raw 80-dim feature vector to (p_seq, s_seq) tensors.
-    scaler: sklearn StandardScaler fitted on training data (optional).
+    Preprocess a single 80-dim CICFlowMeter feature vector.
+    Applies same normalisation as training (Section IV-A-1).
     """
-    x = feature_vector.astype(np.float32)
+    x = raw_features.astype(np.float32)
+    x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+    x = np.clip(x, -1e9, 1e9)
+
     if scaler is not None:
-        x = scaler.transform(x.reshape(1, -1)).flatten()
+        x = scaler.transform(x.reshape(1, -1)).squeeze()
 
-    # Pad/trim to 80 features
-    if x.shape[0] < 80:
-        x = np.pad(x, (0, 80 - x.shape[0]))
-    else:
-        x = x[:80]
+    d_p = config.CAGRT_PACKET_FEAT_DIM
+    T   = config.CAGRT_SEQ_LEN
 
-    half = 40
-    T    = seq_len or CAGRT["sequence_length"]
-    p    = torch.from_numpy(x[:half]).unsqueeze(0).unsqueeze(0).expand(1, T, -1)  # (1,T,40)
-    s    = torch.from_numpy(x[half:]).unsqueeze(0).unsqueeze(0).expand(1, T, -1)
-    return p, s
+    p = torch.from_numpy(x[:d_p]).float().unsqueeze(0).unsqueeze(0)  # (1,1,d_p)
+    s = torch.from_numpy(x[d_p:]).float().unsqueeze(0).unsqueeze(0)  # (1,1,d_s)
+
+    p_seq = p.expand(-1, T, -1)  # (1, T, d_p)
+    s_seq = s.expand(-1, T, -1)  # (1, T, d_s)
+    return p_seq, s_seq
 
 
+@torch.no_grad()
 def predict(model, p_seq: torch.Tensor, s_seq: torch.Tensor,
-            device, class_names=None) -> dict:
-    """Run forward pass and return prediction dict."""
-    class_names = class_names or CLASS_NAMES
-    model.eval()
-    with torch.no_grad():
-        logits = model(p_seq.to(device), s_seq.to(device))
-        probs  = F.softmax(logits, dim=-1).cpu().squeeze(0)
-        pred   = probs.argmax().item()
-    return {
-        "predicted_class": pred,
-        "predicted_label": class_names[pred] if pred < len(class_names) else str(pred),
-        "confidence":      float(probs[pred]),
-        "probabilities":   probs.numpy(),
-    }
+            device: str = config.DEVICE):
+    """
+    Run CA-GRT forward pass and return class prediction with confidence scores.
+    """
+    p_seq = p_seq.to(device)
+    s_seq = s_seq.to(device)
+    logits, h_fused = model(p_seq, s_seq)
+    probs  = torch.softmax(logits, dim=-1).squeeze(0).cpu().numpy()
+    pred   = int(probs.argmax())
+    return pred, probs, h_fused.cpu()
 
 
-def visualize_prediction(result: dict, class_names=None,
-                          save_path: str = None):
-    """Bar chart of class probabilities."""
-    class_names = class_names or CLASS_NAMES
-    probs = result["probabilities"]
-    n     = len(probs)
-    names = class_names[:n]
+def visualize_prediction(probs: np.ndarray, pred: int, save_path: str):
+    """Bar chart of class probabilities for a single inference."""
+    classes = [CLASS_NAMES.get(i, str(i)) for i in range(len(probs))]
+    colors  = ["#d62728" if i == pred else "#1f77b4" for i in range(len(probs))]
 
-    colors = ['#e74c3c' if i == result["predicted_class"] else '#3498db'
-              for i in range(n)]
-
-    fig, ax = plt.subplots(figsize=(10, 5))
-    bars = ax.barh(names, probs * 100, color=colors, alpha=0.85)
-    ax.set_xlabel('Probability (%)', fontsize=11)
-    ax.set_title(
-        f'MutaShield-Net Prediction\n'
-        f'Predicted: {result["predicted_label"]}  '
-        f'(Confidence: {result["confidence"]*100:.1f}%)',
-        fontsize=12
-    )
-    ax.set_xlim(0, 105)
+    fig, ax = plt.subplots(figsize=(12, 5))
+    bars = ax.bar(classes, probs * 100, color=colors, edgecolor="black", linewidth=0.5)
+    ax.set_ylabel("Confidence (%)", fontname="Times New Roman")
+    ax.set_title(f"MutaShield-Net Prediction: {CLASS_NAMES.get(pred, pred)} "
+                 f"({probs[pred]*100:.1f}% confidence)",
+                 fontname="Times New Roman", fontsize=12)
+    ax.set_ylim(0, 110)
+    ax.tick_params(axis="x", rotation=45)
     for bar, p in zip(bars, probs):
-        ax.text(p*100 + 0.5, bar.get_y() + bar.get_height()/2,
-                f'{p*100:.1f}%', va='center', fontsize=9)
+        if p > 0.005:
+            ax.text(bar.get_x() + bar.get_width() / 2,
+                    bar.get_height() + 1, f"{p*100:.1f}",
+                    ha="center", va="bottom", fontsize=8)
     plt.tight_layout()
-
-    if save_path:
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        print(f"Visualization saved: {save_path}")
-    else:
-        plt.savefig(os.path.join(RESULTS_DIR, "inference_result.png"),
-                    dpi=150, bbox_inches='tight')
+    plt.savefig(save_path, dpi=600, bbox_inches="tight")
     plt.close()
+    log.info(f"Prediction chart saved: {save_path}")
 
 
 def main():
-    set_seed(RANDOM_SEED)
-    model, device = load_model()
-    print(f"Model loaded on {device}")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--ckpt",      default=config.BEST_CKPT)
+    parser.add_argument("--input",     type=str, default=None,
+                        help="JSON file with 80 CICFlowMeter features, or omit for demo")
+    parser.add_argument("--n-classes", type=int, default=15)
+    parser.add_argument("--save-dir",  type=str, default=config.RESULTS_DIR)
+    args = parser.parse_args()
 
-    # ── Demo: random feature vector ───────────────────────────────────────────
-    print("\nRunning demo inference on random 80-dim feature vector…")
-    x_demo = np.random.randn(80).astype(np.float32)
-    p_seq, s_seq = preprocess_sample(x_demo)
+    device = config.DEVICE
+    os.makedirs(args.save_dir, exist_ok=True)
 
-    result = predict(model, p_seq, s_seq, device)
-    print(f"\nPrediction:")
-    print(f"  Class  : {result['predicted_label']} (index {result['predicted_class']})")
-    print(f"  Confidence: {result['confidence']*100:.2f}%")
-    print(f"  All probabilities:")
-    for i, (name, p) in enumerate(zip(CLASS_NAMES[:len(result['probabilities'])],
-                                       result['probabilities'])):
-        print(f"    {name:20s}: {p*100:6.2f}%")
+    # ── Load model ───────────────────────────────────────────────────────
+    if not os.path.exists(args.ckpt):
+        log.warning(f"Checkpoint not found: {args.ckpt}. Using untrained model for demo.")
+        model = MutaShieldNet(n_classes=args.n_classes).to(device)
+        model.eval()
+    else:
+        model = load_model(args.ckpt, args.n_classes, device)
 
-    save_path = os.path.join(RESULTS_DIR, "inference_result.png")
-    visualize_prediction(result, save_path=save_path)
+    # ── Load or generate input ───────────────────────────────────────────
+    if args.input and os.path.exists(args.input):
+        with open(args.input) as f:
+            features = np.array(json.load(f), dtype=np.float32)
+        log.info(f"Loaded features from {args.input}: shape={features.shape}")
+    else:
+        log.info("No input file provided — using random demo feature vector.")
+        # Generate a plausible random 80-dim feature vector
+        features = np.random.randn(config.N_FEATURES).astype(np.float32)
 
-    # ── From CSV row ──────────────────────────────────────────────────────────
-    csv_path = sys.argv[1] if len(sys.argv) > 1 else None
-    if csv_path and os.path.exists(csv_path):
-        import pandas as pd
-        row = pd.read_csv(csv_path).iloc[0]
-        # Drop non-numeric columns
-        nums = row.select_dtypes(include=[float, int]).values.astype(np.float32)
-        p_seq, s_seq = preprocess_sample(nums)
-        result = predict(model, p_seq, s_seq, device)
-        print(f"\nCSV sample prediction: {result['predicted_label']} "
-              f"({result['confidence']*100:.1f}%)")
-        visualize_prediction(result,
-                             save_path=os.path.join(RESULTS_DIR, "inference_csv.png"))
+    assert features.shape == (config.N_FEATURES,), \
+        f"Expected shape ({config.N_FEATURES},), got {features.shape}"
+
+    # ── Inference ────────────────────────────────────────────────────────
+    p_seq, s_seq = preprocess_sample(features)
+    pred, probs, _ = predict(model, p_seq, s_seq, device)
+
+    print(f"\nPredicted class : {CLASS_NAMES.get(pred, pred)} (index {pred})")
+    print(f"Confidence      : {probs[pred]*100:.2f}%")
+    print(f"Threat detected : {'YES — ATTACK' if pred != 0 else 'NO — BENIGN'}\n")
+
+    for i, p in enumerate(probs):
+        bar = "#" * int(p * 50)
+        print(f"  {CLASS_NAMES.get(i, i):20s} | {bar:<50} {p*100:5.1f}%")
+
+    # ── Visualise ────────────────────────────────────────────────────────
+    vis_path = os.path.join(args.save_dir, "inference_result.png")
+    visualize_prediction(probs, pred, vis_path)
 
 
 if __name__ == "__main__":

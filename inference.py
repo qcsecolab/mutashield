@@ -1,9 +1,3 @@
-"""
-inference.py — MutaShield-Net Single-Sample Inference
-Accepts a single 80-dimensional CICFlowMeter feature vector,
-runs CA-GRT detection, and outputs a prediction with confidence.
-"""
-
 import os
 import argparse
 import logging
@@ -24,7 +18,6 @@ logging.basicConfig(level=logging.INFO,
                     format="%(levelname)s: %(message)s")
 log = logging.getLogger(__name__)
 
-# Human-readable class names for CIC-IDS2017 (15 classes including benign)
 CLASS_NAMES = {
     0:  "BENIGN",
     1:  "FTP-Patator",
@@ -53,10 +46,7 @@ def load_model(ckpt_path: str, n_classes: int = 15, device: str = config.DEVICE)
 
 
 def preprocess_sample(raw_features: np.ndarray, scaler=None) -> tuple:
-    """
-    Preprocess a single 80-dim CICFlowMeter feature vector.
-    Applies same normalisation as training (Section IV-A-1).
-    """
+
     x = raw_features.astype(np.float32)
     x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
     x = np.clip(x, -1e9, 1e9)
@@ -67,20 +57,18 @@ def preprocess_sample(raw_features: np.ndarray, scaler=None) -> tuple:
     d_p = config.CAGRT_PACKET_FEAT_DIM
     T   = config.CAGRT_SEQ_LEN
 
-    p = torch.from_numpy(x[:d_p]).float().unsqueeze(0).unsqueeze(0)  # (1,1,d_p)
-    s = torch.from_numpy(x[d_p:]).float().unsqueeze(0).unsqueeze(0)  # (1,1,d_s)
+    p = torch.from_numpy(x[:d_p]).float().unsqueeze(0).unsqueeze(0)  
+    s = torch.from_numpy(x[d_p:]).float().unsqueeze(0).unsqueeze(0)  
 
-    p_seq = p.expand(-1, T, -1)  # (1, T, d_p)
-    s_seq = s.expand(-1, T, -1)  # (1, T, d_s)
+    p_seq = p.expand(-1, T, -1) 
+    s_seq = s.expand(-1, T, -1) 
     return p_seq, s_seq
 
 
 @torch.no_grad()
 def predict(model, p_seq: torch.Tensor, s_seq: torch.Tensor,
             device: str = config.DEVICE):
-    """
-    Run CA-GRT forward pass and return class prediction with confidence scores.
-    """
+
     p_seq = p_seq.to(device)
     s_seq = s_seq.to(device)
     logits, h_fused = model(p_seq, s_seq)
@@ -90,7 +78,6 @@ def predict(model, p_seq: torch.Tensor, s_seq: torch.Tensor,
 
 
 def visualize_prediction(probs: np.ndarray, pred: int, save_path: str):
-    """Bar chart of class probabilities for a single inference."""
     classes = [CLASS_NAMES.get(i, str(i)) for i in range(len(probs))]
     colors  = ["#d62728" if i == pred else "#1f77b4" for i in range(len(probs))]
 
@@ -140,7 +127,6 @@ def main():
         log.info(f"Loaded features from {args.input}: shape={features.shape}")
     else:
         log.info("No input file provided — using random demo feature vector.")
-        # Generate a plausible random 80-dim feature vector
         features = np.random.randn(config.N_FEATURES).astype(np.float32)
 
     assert features.shape == (config.N_FEATURES,), \
@@ -163,5 +149,4 @@ def main():
     visualize_prediction(probs, pred, vis_path)
 
 
-if __name__ == "__main__":
-    main()
+if __name__ == "__main__": main()

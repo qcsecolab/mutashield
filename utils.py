@@ -1,8 +1,3 @@
-"""
-utils.py — MutaShield-Net Utility Functions
-Metrics (Equations 31-35), visualisation, and augmentation helpers.
-"""
-
 import os
 import numpy as np
 import matplotlib
@@ -21,7 +16,6 @@ import config
 
 
 class AverageMeter:
-    """Tracks running average of a scalar."""
     def __init__(self):
         self.reset()
 
@@ -41,10 +35,7 @@ class AverageMeter:
 def compute_metrics(labels: np.ndarray, preds: np.ndarray,
                     probs: np.ndarray = None,
                     n_classes: int = None) -> dict:
-    """
-    Compute all metrics reported in Table VI-VII.
-    Equations 31-35.
-    """
+
     acc  = 100.0 * accuracy_score(labels, preds)
     prec = 100.0 * precision_score(labels, preds,
                                    average="weighted", zero_division=0)
@@ -53,7 +44,6 @@ def compute_metrics(labels: np.ndarray, preds: np.ndarray,
     f1   = 100.0 * f1_score(labels, preds,
                             average="weighted", zero_division=0)
 
-    # False Positive Rate — Equation 35: FP / (FP + TN)
     cm   = confusion_matrix(labels, preds)
     fp   = cm.sum(axis=0) - np.diag(cm)
     fn   = cm.sum(axis=1) - np.diag(cm)
@@ -63,7 +53,6 @@ def compute_metrics(labels: np.ndarray, preds: np.ndarray,
     fpr  = 100.0 * float(np.average(fpr_per_class,
                                     weights=cm.sum(axis=1)))
 
-    # AUC-ROC (macro-average OvR)
     auc_score = 0.0
     if probs is not None and n_classes is not None:
         try:
@@ -91,10 +80,7 @@ def compute_metrics(labels: np.ndarray, preds: np.ndarray,
 def plot_training_curves(train_losses, val_losses,
                          train_accs, val_accs,
                          save_dir: str):
-    """
-    Reproduce Figure 2 from the paper (training/validation loss over 100 epochs).
-    IEEE matplotlib style, 600 dpi, Times New Roman.
-    """
+
     epochs = list(range(1, len(train_losses) + 1))
     fig, axes = plt.subplots(1, 2, figsize=(12, 4))
 
@@ -126,9 +112,7 @@ def plot_training_curves(train_losses, val_losses,
 
 
 def plot_mss_evolution(mss_history: list, drs_history: list, save_dir: str):
-    """
-    Reproduce Figure 3 from the paper: MSS and DRS over 50 AMFEL generations.
-    """
+
     gens = list(range(1, len(mss_history) + 1))
     fig, axes = plt.subplots(1, 2, figsize=(12, 4))
 
@@ -160,10 +144,7 @@ def plot_mss_evolution(mss_history: list, drs_history: list, save_dir: str):
 
 
 def plot_mutant_taxonomy(save_dir: str):
-    """
-    Reproduce Table V mutant classification breakdown as a stacked bar chart.
-    Values taken directly from Table V in the paper.
-    """
+
     families  = ["SQL Inj.", "XSS", "Cmd Inj.", "Path Trav.", "DoS", "Recon.", "Auth Bypass"]
     stillborn = [2.8, 3.1, 4.2, 2.9, 3.5, 2.6, 3.8]
     trivial   = [58.1, 56.4, 54.7, 60.3, 63.2, 55.8, 52.9]
@@ -200,10 +181,7 @@ def plot_mutant_taxonomy(save_dir: str):
 
 
 def plot_performance_comparison(save_dir: str):
-    """
-    Reproduce Table VI as a grouped bar chart (accuracy on CIC-IDS2017).
-    Values taken directly from Table VI in the paper.
-    """
+
     methods = ["RF", "DNN", "CNN-IDS", "LSTM-IDS", "GAN-IDS",
                "CNN-LSTM", "GWO-GA", "CrossAttn", "GAT-IDS",
                "FL-WGAN", "MutaShield"]
@@ -248,10 +226,7 @@ def plot_performance_comparison(save_dir: str):
 
 
 def plot_adversarial_robustness(save_dir: str):
-    """
-    Reproduce Table VIII as grouped bars.
-    Values from Table VIII in the paper.
-    """
+
     methods  = ["CNN-IDS", "LSTM-IDS", "GAN-IDS", "GAT-IDS", "FL-WGAN", "MutaShield"]
     clean    = [96.78, 97.23, 97.56, 98.78, 99.01, 99.47]
     fgsm     = [67.23, 71.56, 78.34, 82.45, 85.67, 94.23]
@@ -286,10 +261,7 @@ def plot_adversarial_robustness(save_dir: str):
 
 
 def plot_ablation_study(save_dir: str):
-    """
-    Reproduce Table IX ablation results as grouped bars.
-    Values from Table IX in the paper.
-    """
+
     configs_   = ["Full", "w/o SMOE", "w/o CrossAttn", "w/o Gating",
                   "w/o AMFEL", "w/o BiGRU", "w/o Semantic"]
     acc_vals   = [99.47, 98.56, 98.89, 99.12, 98.34, 99.01, 98.78]
@@ -324,7 +296,6 @@ def plot_ablation_study(save_dir: str):
 
 
 if __name__ == "__main__":
-    # Generate all results figures from paper table values
     out_dir = config.RESULTS_DIR
     os.makedirs(out_dir, exist_ok=True)
 

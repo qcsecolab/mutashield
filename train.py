@@ -1,9 +1,3 @@
-"""
-train.py — MutaShield-Net Training Pipeline
-Implements the closed mutation-assessment-improvement cycle (Section III-A).
-Hyperparameters from Table IV (Section IV-A-2).
-Five random seeds: [42, 123, 456, 789, 1024] (Section IV-A-2).
-"""
 
 import os
 import time
@@ -43,12 +37,7 @@ def build_model(n_classes: int = 15) -> MutaShieldNet:
 
 def train_one_epoch(model, loader, optimizer, criterion, scaler,
                     device, lambda_adv=config.LAMBDA):
-    """
-    One epoch of standard training.
-    Loss = CE(clean) + λ * CE(mutated) — Equation 1.
-    Mutated-sample contribution is approximated via SMOE perturbation
-    inline during training; full AMFEL runs at specified generation intervals.
-    """
+
     model.train()
     loss_meter = AverageMeter()
     correct = 0
@@ -65,8 +54,6 @@ def train_one_epoch(model, loader, optimizer, criterion, scaler,
             logits, _ = model(p_seq, s_seq)
             loss_clean = criterion(logits, labels)
 
-            # Inline SMOE perturbation for adversarial loss term (Eq. 1)
-            # Full co-evolutionary AMFEL runs at generation checkpoints below
             flat_p = p_seq[:, 0, :]    # (batch, d_p) — take first time step
             flat_s = s_seq[:, 0, :]    # (batch, d_s)
             flat_x = torch.cat([flat_p, flat_s], dim=-1)    # (batch, 80)

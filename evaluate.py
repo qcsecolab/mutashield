@@ -1,9 +1,3 @@
-"""
-evaluate.py — MutaShield-Net Evaluation
-Reproduces Tables VI, VII, VIII from the paper.
-Metrics: Accuracy, Precision, Recall, F1, FPR, AUC-ROC (Equations 31-35).
-Adversarial robustness under FGSM, PGD, C&W, AutoAttack (Table VIII).
-"""
 
 import os
 import logging
@@ -79,15 +73,12 @@ def fgsm_attack(model, p_seq, s_seq, labels, epsilon, device):
 
 @torch.no_grad()
 def evaluate_adversarial(model, loader, device, epsilon=0.03):
-    """
-    Table VIII: evaluate accuracy under FGSM.
-    Full PGD, C&W, AutoAttack require the torchattacks library.
-    """
+
     correct = 0
     total   = 0
     for p_seq, s_seq, labels in loader:
         with torch.enable_grad():
-            model.train()  # needed for grad through BN
+            model.train()  
             p_adv, s_adv = fgsm_attack(model, p_seq, s_seq, labels, epsilon, device)
         model.eval()
         logits, _ = model(p_adv, s_adv)
@@ -111,7 +102,6 @@ def plot_confusion_matrix(labels, preds, class_names, save_path):
 
 
 def plot_roc_curves(labels, probs, n_classes, save_path):
-    """One-vs-rest ROC curves for each class."""
     y_bin = label_binarize(labels, classes=list(range(n_classes)))
     fig, ax = plt.subplots(figsize=(10, 8))
     colors  = plt.cm.tab20(np.linspace(0, 1, n_classes))
@@ -138,7 +128,6 @@ def plot_roc_curves(labels, probs, n_classes, save_path):
 
 
 def print_results_table(metrics, dataset_name="CIC-IDS2017"):
-    """Reproduce the format of Table VI from the paper."""
     print(f"\n{'='*65}")
     print(f"  Results on {dataset_name}")
     print(f"{'='*65}")
@@ -181,24 +170,19 @@ def main():
     metrics = compute_metrics(labels, preds, probs=probs, n_classes=n_classes)
     print_results_table(metrics)
 
-    # ── Per-class report (Table VII format) ─────────────────────────────
     print(classification_report(labels, preds, digits=4))
 
-    # ── Confusion matrix ─────────────────────────────────────────────────
     cm_path = os.path.join(config.RESULTS_DIR, "confusion_matrix.png")
     class_names = [str(i) for i in range(n_classes)]
     plot_confusion_matrix(labels, preds, class_names, cm_path)
 
-    # ── ROC curves ───────────────────────────────────────────────────────
     roc_path = os.path.join(config.RESULTS_DIR, "roc_curves.png")
     plot_roc_curves(labels, probs, n_classes, roc_path)
 
-    # ── Adversarial evaluation (FGSM) ───────────────────────────────────
     if args.adv:
         fgsm_acc = evaluate_adversarial(model, test_loader, device, epsilon=0.03)
         log.info(f"FGSM adversarial accuracy: {fgsm_acc:.2f}% "
                  f"(paper reports 94.23% for MutaShield-Net)")
 
 
-if __name__ == "__main__":
-    main()
+if __name__ == "__main__": main()

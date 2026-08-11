@@ -1,17 +1,3 @@
-"""
-dataset.py — MutaShield-Net Dataset Handling
-Dataset: CIC-IDS2017 and CSE-CIC-IDS2018
-Source: Canadian Institute for Cybersecurity, University of New Brunswick
-CIC-IDS2017 URL: https://www.unb.ca/cic/datasets/ids-2017.html
-CSE-CIC-IDS2018 URL: https://www.unb.ca/cic/datasets/ids-2018.html
-
-Preprocessing follows Section IV-A-1 and IV-A-2:
-  - 80 CICFlowMeter features
-  - Duplicate removal by 5-tuple matching
-  - Temporally stratified 70/10/20 split (days 1-3 train, day 4 val, day 5 test)
-  - Class imbalance: benign traffic >80% of both corpora
-"""
-
 import os
 import glob
 import pickle
@@ -28,13 +14,9 @@ import config
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 log = logging.getLogger(__name__)
 
-# ─── CICFlowMeter column name normalisations ────────────────────────────────
-# The CSVs from CIC have inconsistent leading/trailing spaces; strip all.
-
 LABEL_COL   = "Label"
 BENIGN_STR  = "BENIGN"
 
-# Features to drop (non-numeric or constant in CIC exports)
 DROP_COLS = [
     "Flow ID", "Source IP", "Source Port", "Destination IP",
     "Destination Port", "Protocol", "Timestamp",
@@ -47,7 +29,6 @@ def _strip_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _load_csv_dir(directory: str) -> pd.DataFrame:
-    """Load all CSV files from a directory and concatenate."""
     paths = sorted(glob.glob(os.path.join(directory, "**", "*.csv"), recursive=True))
     if not paths:
         paths = sorted(glob.glob(os.path.join(directory, "*.csv")))
@@ -71,11 +52,7 @@ def _load_csv_dir(directory: str) -> pd.DataFrame:
 
 
 def _remove_duplicates(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Section IV-A-2: remove duplicates by matching 5-tuples with identical
-    feature vectors. CIC CSVs do not export raw 5-tuple fields, so we
-    deduplicate on the full 80-feature numeric vector instead.
-    """
+
     before = len(df)
     numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
     df = df.drop_duplicates(subset=numeric_cols)
@@ -86,7 +63,6 @@ def _remove_duplicates(df: pd.DataFrame) -> pd.DataFrame:
 
 def _encode_labels(df: pd.DataFrame, label_map: dict) -> pd.DataFrame:
     df[LABEL_COL] = df[LABEL_COL].str.strip()
-    # Map known labels; unknown labels get -1 and are dropped
     df["label_int"] = df[LABEL_COL].map(label_map)
     before = len(df)
     df = df.dropna(subset=["label_int"])
@@ -97,14 +73,7 @@ def _encode_labels(df: pd.DataFrame, label_map: dict) -> pd.DataFrame:
 
 
 def preprocess(df: pd.DataFrame, label_map: dict, scaler=None, fit_scaler=True):
-    """
-    Full preprocessing pipeline:
-    1. Encode labels
-    2. Drop non-feature columns
-    3. Replace inf/NaN with 0
-    4. Standard-scale features
-    Returns: X (np.ndarray), y (np.ndarray), fitted scaler
-    """
+
     df = _encode_labels(df, label_map)
 
     drop_existing = [c for c in DROP_COLS if c in df.columns]
@@ -114,10 +83,8 @@ def preprocess(df: pd.DataFrame, label_map: dict, scaler=None, fit_scaler=True):
     X = df[feature_cols].values.astype(np.float32)
     y = df["label_int"].values.astype(np.int64)
 
-    # Replace inf and NaN — Section IV-A-1
     X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
 
-    # Clip extreme values to prevent scaler blow-up
     X = np.clip(X, -1e9, 1e9)
 
     if scaler is None:
@@ -132,12 +99,7 @@ def preprocess(df: pd.DataFrame, label_map: dict, scaler=None, fit_scaler=True):
 
 
 def temporally_split(X, y, timestamps=None):
-    """
-    Section IV-A-2: temporally stratified protocol.
-    When timestamps are unavailable (raw CSVs are already day-ordered),
-    we approximate by positional ordering — first 70% train,
-    next 10% val, last 20% test.
-    """
+
     n = len(X)
     n_train = int(n * config.TRAIN_RATIO)
     n_val   = int(n * (config.TRAIN_RATIO + config.VAL_RATIO))
@@ -153,11 +115,7 @@ def temporally_split(X, y, timestamps=None):
 def build_dataset_cic2017(raw_dir=config.CIC2017_RAW_DIR,
                            proc_dir=config.CIC2017_PROC_DIR,
                            force_rebuild=False):
-    """
-    Full pipeline for CIC-IDS2017.
-    Returns train/val/test splits plus the fitted scaler.
-    Caches processed arrays to proc_dir.
-    """
+
     cache_path = os.path.join(proc_dir, "cic2017_splits.pkl")
     if os.path.exists(cache_path) and not force_rebuild:
         log.info(f"Loading cached splits from {cache_path}")
@@ -181,18 +139,7 @@ def build_dataset_cic2017(raw_dir=config.CIC2017_RAW_DIR,
 # ─── PyTorch Dataset ─────────────────────────────────────────────────────────
 
 class IDSDataset(Dataset):
-    """
-    PyTorch Dataset wrapping preprocessed CICFlowMeter feature arrays.
 
-    The CA-GRT model expects a sequence of length T_seq (Section IV-A-2, p95
-    of flow lengths = 100). For flow-level data each sample is a single vector;
-    we replicate it to form a dummy sequence so the BiGRU encoder receives
-    a proper (batch, seq_len, feat_dim) tensor. In production, replace with
-    actual per-packet sequences if raw PCAP access is available.
-
-    Packet-domain features  p: first d_p dims of the 80-feature vector
-    Semantic-domain features s: remaining d_s dims                       (Eq. 9-10)
-    """
 
     def __init__(self, X: np.ndarray, y: np.ndarray,
                  seq_len: int = config.CAGRT_SEQ_LEN,
@@ -208,20 +155,19 @@ class IDSDataset(Dataset):
         return len(self.X)
 
     def __getitem__(self, idx):
-        x = self.X[idx]                          # (80,)
-        p = x[:self.packet_dim]                  # (d_p,)
-        s = x[self.packet_dim:]                  # (d_s,)
+        x = self.X[idx]                          
+        p = x[:self.packet_dim]                  
+        s = x[self.packet_dim:]                  
 
-        # Replicate single feature vector into sequence: (seq_len, feat_dim)
-        p_seq = p.unsqueeze(0).expand(self.seq_len, -1)  # (T, d_p)
-        s_seq = s.unsqueeze(0).expand(self.seq_len, -1)  # (T, d_s)
+        
+        p_seq = p.unsqueeze(0).expand(self.seq_len, -1)  
+        s_seq = s.unsqueeze(0).expand(self.seq_len, -1)  
 
         return p_seq, s_seq, self.y[idx]
 
 
 def get_dataloaders(train_split, val_split, test_split,
                     batch_size=config.BATCH_SIZE, num_workers=4):
-    """Return train, val, and test DataLoaders."""
     X_train, y_train = train_split
     X_val,   y_val   = val_split
     X_test,  y_test  = test_split
